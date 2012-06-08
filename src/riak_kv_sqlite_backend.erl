@@ -26,13 +26,7 @@
 % -define(CAPABILITIES, [async_fold, indexes]).
 -define(CAPABILITIES, []).
 
--record(state, {ref :: reference(),
-                data_root :: string(),
-                config :: config(),
-                read_opts = [],
-                write_opts = [],
-                fold_opts = [{fill_cache, false}]
-               }).
+-record(state, {ref :: reference()}).
 
 -type state() :: #state{}.
 -type config() :: [{atom(), term()}].
@@ -56,8 +50,35 @@ capabilities(_, _) ->
 %% @doc Start the sqlite backend
 -spec start(integer(), config()) -> {ok, state()} | {error, term()}.
 start(Partition, Config) ->
-    DataDir = filename:join(app_helper:get_prop_or_env(data_root, Config, sqlite), integer_to_list(Partition)),
-    sqlite3:open(DataDir, {file, DataDir}).
+    DataDir = filename:join(app_helper:get_prop_or_env(data_root, Config, sqlite3), integer_to_list(Partition)),
+    filelib:ensure_dir(DataDir),
+    %io:fwrite(DataDir),
+    %io:fwrite("\n"),
+    %{ok, Pid} = sqlite3:open(file, [{file, DataDir}]),
+    %io:fwrite("Trying to open sqlite3 database...\n"),
+    Db = list_to_atom(integer_to_list(Partition)),
+    {ok, Pid} = sqlite3:open(Db, [{file, DataDir}]),
+    %io:fwrite("database opened.\n"),
+    ok = sqlite3:sql_exec(Db,
+        "CREATE TABLE IF NOT EXISTS store (
+            bucket BLOB,
+            key BLOB,
+            value BLOB,
+            CONSTRAINT store_primary_key PRIMARY KEY (bucket, key)
+        );"
+    ),
+    %% TODO prepare some statements
+    %sqlite3:create_table(Db, store, [{bucket, blob}, {key, blob}, {value, blob}]),
+    {ok, #state{ref=Pid}}.
+    %% io:write(Partition),
+    %% io:fwrite("\n"),
+    %% io:write(Config),
+    %% io:fwrite("\n"),
+    %% DataDir = filename:join(app_helper:get_prop_or_env(data_root, Config, sqlite3), integer_to_list(Partition)),
+    %% io:fwrite(DataDir),
+    %% io:fwrite("\n"),
+    %{ok, Pid} = sqlite3:open(DataDir, {file, DataDir}),
+    %{ok, #state{ref=Pid}},
     % create table if not exists
 
 %% @doc Stop the sqlite backend
@@ -69,53 +90,76 @@ stop(_State) ->
                  {ok, any(), state()} |
                  {ok, not_found, state()} |
                  {error, term(), state()}.
-get(_Bucket, _Key, State) ->
-    {ok, <<"dummy value">>, State}.
+get(Bucket, Key, #state{ref=Ref}=State) ->
+    io:write(State),
+    io:fwrite("\n"),
+    case sqlite3:sql_exec(Ref, "SELECT value FROM store WHERE bucket = ? AND key = ?",
+        [{1, Bucket}, {2, Key}]) of
+        [{columns,_},{rows,[{Value}]}] ->
+            io:fwrite("Value: ~80p~n", [Value]),
+            {ok, Value, State};
+        Result ->
+            io:fwrite("Result: ~80p~n", [Result]),
+            {error, not_found, State}
+    end.
 
 %% @doc Insert an object into the sqlite backend.
 -type index_spec() :: {add, Index, SecondaryKey} | {remove, Index, SecondaryKey}.
 -spec put(riak_object:bucket(), riak_object:key(), [index_spec()], binary(), state()) ->
                  {ok, state()} |
                  {error, term(), state()}.
-put(_Bucket, _Key, _IndexSpecs, _Val, State) ->
-    {ok, State}.
-%%    StorageKey = to_object_key(Bucket, Key),
-%%    sqlite3:exec().
-%%
+put(Bucket, Key, IndexSpecs, Val, #state{ref=Ref}=State) ->
+    io:fwrite("Bucket: ~80p~n", [Bucket]),
+    io:fwrite("Key: ~80p~n", [Key]),
+    io:fwrite("IndexSpecs: ~80p~n", [IndexSpecs]),
+    io:fwrite("Val: ~80p~n", [Val]),
+    io:fwrite("Ref: ~80p~n", [Ref]),
+    case sqlite3:sql_exec(Ref,
+            "INSERT OR REPLACE INTO store (bucket, key, value) VALUES (?, ?, ?);",
+            [{1, Bucket}, {2, Key}, {3, Val}]) of
+
+                {rowid, _} ->
+                    {ok, State};
+                [_, _, Error] ->
+                    {error, Error, State}
+    end.
+
 %%%% @doc Delete an object from the sqlite backend
 -spec delete(riak_object:bucket(), riak_object:key(), [index_spec()], state()) ->
                     {ok, state()} |
                     {error, term(), state()}.
-delete(_Bucket, _Key, _IndexSpecs, State) ->
-    {ok, State}.
-%%
-%%    %% Create the KV delete...
-%%
+delete(Bucket, Key, _IndexSpecs, #state{ref=Ref}=State) ->
+    case sqlite3:sql_exec(Ref,
+            "DELETE FROM store WHERE bucket = ? AND key = ?;",
+            [{1, Bucket}, {2, Key}]) of
+                ok ->
+                    {ok, State};
+                [_, _, Error] ->
+                    {error, Error, State}
+    end.
+
 %% @doc Delete all objects from this sqlite backend
 %% and return a fresh reference.
 -spec drop(state()) -> {ok, state()} | {error, term(), state()}.
-drop(State) ->
-    {ok, State}.
-
-%%    case sqlite3:destroy(DataRoot, []) of
-%%        ok ->
-%%            case sqlite3:open(DataRoot, [{file, DataRoot}]) of
-%%                {ok, Ref} ->
-%%                    {ok, State#state { ref = Ref }};
-%%                {error, Reason} ->
-%%                    {error, Reason, State}
-%%            end;
-%%        {error, Reason} ->
-%%            {error, Reason, State}
-%%    end.
-%%
+drop(#state{ref=Ref}=State) ->
+    case sqlite3:sql_exec(Ref, "DELETE FROM store;") of
+            ok ->
+                {ok, State};
+            _ ->
+                {error, "An error.", State}
+    end.
 
 %% @doc Returns true if this sqlite backend contains any
 %% non-tombstone values; otherwise returns false.
 -spec is_empty(state()) -> boolean() | {error, term()}.
-is_empty(_State) ->
-    true.
-    %sqlite3:is_empty(Ref).
+is_empty(#state{ref=Ref}) ->
+    % http://www.mail-archive.com/sqlite-users@sqlite.org/msg19151.html
+    case sqlite3:sql_exec(Ref, "SELECT (SELECT bucket FROM store LIMIT 1) IS NOT NULL;") of
+        [{columns,_},{rows,[{Value}]}] ->
+            Value;
+        _ ->
+            {error, "Error in is_empty()"}
+    end.
 
 %% @doc Get the status information for this eleveldb backend
 -spec status(state()) -> [{atom(), term()}].
@@ -133,25 +177,76 @@ callback(_Ref, _Msg, State) ->
                    any(),
                    [],
                    state()) -> {ok, any()} | {async, fun()}.
-fold_buckets(_FoldBucketsFun, _Acc, _Opts, _State) ->
-    {ok, []}.
+fold_buckets(FoldBucketsFun, Acc, _Opts, #state{ref=Ref}) ->
+    FoldFun = fun ({Bucket}, Acc2) ->
+            FoldBucketsFun(Bucket, Acc2)
+    end,
+    %TODO implement async fold
+    [{columns, ["bucket"]}, {rows, Rows}] = sqlite3:sql_exec(Ref,
+        "SELECT DISTINCT bucket FROM store;"
+    ),
+    Result = lists:foldl(FoldFun, Acc, Rows),
+    {ok, Result}.
 
 %% @doc Fold over all the keys for one or all buckets.
 -spec fold_keys(riak_kv_backend:fold_keys_fun(),
                 any(),
                 [{atom(), term()}],
                 state()) -> {ok, term()} | {async, fun()}.
-fold_keys(_FoldKeysFun, _Acc, _Opts, _State) ->
-    {ok, []}.
+fold_keys(FoldKeysFun, Acc, Opts, #state{ref=Ref}) ->
+
+    Bucket = lists:keyfind(bucket, 1, Opts),
+    BucketKeys = if
+        %TODO implement index queries
+        Bucket /= false ->
+            {bucket, FilterBucket} = Bucket,
+            [{columns, ["bucket", "key"]},{rows, Rows}] = sqlite3:sql_exec(Ref,
+                "SELECT bucket, key FROM store WHERE bucket = ?",
+                [{1, FilterBucket}]
+            ),
+            Rows;
+        true ->
+            [{columns, ["bucket", "key"]},{rows, Rows}] = sqlite3:sql_exec(Ref,
+                "SELECT bucket, key FROM store"
+            ),
+            Rows
+    end,
+    Folder = fun ({Bucket2, Key2}, Acc2) ->
+            FoldKeysFun(Bucket2, Key2, Acc2)
+    end,
+    %TODO implement async fold
+    Result = lists:foldl(Folder, Acc, BucketKeys),
+    {ok, Result}.
 
 %% @doc Fold over all the objects for one or all buckets.
 -spec fold_objects(riak_kv_backend:fold_objects_fun(),
                    any(),
                    [{atom(), term()}],
                    state()) -> {ok, any()} | {async, fun()}.
-fold_objects(_FoldObjectsFun, _Acc, _Opts, _State) ->
-    {ok, []}.
-
+fold_objects(FoldObjectsFun, Acc, Opts, #state{ref=Ref}) ->
+    %TODO implement async fold
+    Bucket = proplists:get_value(bucket, Opts),
+    BucketsKeysValues = if
+        Bucket /= false ->
+            {bucket, FilterBucket} = Bucket,
+            [{columns, ["bucket", "key", "value"]}, {rows, Rows}] = sqlite3:sql_exec(
+                Ref,
+                "SELECT bucket, key, value FROM store WHERE bucket = ?;",
+                [{1, FilterBucket}]
+            ),
+            Rows;
+        true ->
+            [{colums, ["bucket", "key", "value"]}, {rows, Rows}] = sqlite3:sql_exec(
+                Ref,
+                "SELECT bucket, key, value FROM store;"
+            ),
+            Rows
+    end,
+    FoldFun = fun ({Bucket2, Key2, Value2}, Acc2) ->
+            FoldObjectsFun(Bucket2, Key2, Value2, Acc2)
+    end,
+    Result = lists:foldl(FoldFun, Acc, BucketsKeysValues),
+    {ok, Result}.
 %% ===================================================================
 %% EUnit tests
 %% ===================================================================
