@@ -57,7 +57,15 @@ start(Partition, Config) ->
     %{ok, Pid} = sqlite3:open(file, [{file, DataDir}]),
     %io:fwrite("Trying to open sqlite3 database...\n"),
     Db = list_to_atom(integer_to_list(Partition)),
-    {ok, Pid} = sqlite3:open(Db, [{file, DataDir}]),
+    %TODO maybe improve this
+    % seems like we "restart" database while/after handoff
+    % maybe this was caused by not implementing the stop function?
+    Pid = case sqlite3:open(Db, [{file, DataDir}]) of
+        {error,{already_started,Pid2}} ->
+            Pid2;
+        {ok, Pid2} ->
+            Pid2
+    end,
     %io:fwrite("database opened.\n"),
     ok = sqlite3:sql_exec(Db,
         "CREATE TABLE IF NOT EXISTS store (
@@ -82,8 +90,9 @@ start(Partition, Config) ->
     % create table if not exists
 
 %% @doc Stop the sqlite backend
-stop(_State) ->
-    ok.
+stop(#state{ref=Ref}) ->
+    %TODO maybe do some error handling?
+    sqlite3:close(Ref).
 
 %%%% @doc Retrieve an object from the sqlite backend
 -spec get(riak_object:bucket(), riak_object:key(), state()) ->
@@ -156,7 +165,12 @@ is_empty(#state{ref=Ref}) ->
     % http://www.mail-archive.com/sqlite-users@sqlite.org/msg19151.html
     case sqlite3:sql_exec(Ref, "SELECT (SELECT bucket FROM store LIMIT 1) IS NOT NULL;") of
         [{columns,_},{rows,[{Value}]}] ->
-            Value;
+            Value,
+            if Value =:= 0 ->
+                false;
+            true ->
+                true
+            end;
         _ ->
             {error, "Error in is_empty()"}
     end.
@@ -225,7 +239,7 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{ref=Ref}) ->
                    state()) -> {ok, any()} | {async, fun()}.
 fold_objects(FoldObjectsFun, Acc, Opts, #state{ref=Ref}) ->
     %TODO implement async fold
-    Bucket = proplists:get_value(bucket, Opts),
+    Bucket = lists:keyfind(bucket, 1, Opts),
     BucketsKeysValues = if
         Bucket /= false ->
             {bucket, FilterBucket} = Bucket,
@@ -236,7 +250,7 @@ fold_objects(FoldObjectsFun, Acc, Opts, #state{ref=Ref}) ->
             ),
             Rows;
         true ->
-            [{colums, ["bucket", "key", "value"]}, {rows, Rows}] = sqlite3:sql_exec(
+            [{columns, ["bucket", "key", "value"]}, {rows, Rows}] = sqlite3:sql_exec(
                 Ref,
                 "SELECT bucket, key, value FROM store;"
             ),
@@ -250,7 +264,7 @@ fold_objects(FoldObjectsFun, Acc, Opts, #state{ref=Ref}) ->
 %% ===================================================================
 %% EUnit tests
 %% ===================================================================
--ifdef(TEXT).
+-ifdef(TEST).
 
 simple_test_() ->
     ?assertCmd("rm -rf test/sqlite-backend"),
