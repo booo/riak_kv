@@ -24,7 +24,7 @@
 
 -define(API_VERSION, 1).
 % -define(CAPABILITIES, [async_fold, indexes]).
--define(CAPABILITIES, []).
+-define(CAPABILITIES, [indexes]).
 
 -record(state, {ref :: reference()}).
 
@@ -100,17 +100,43 @@ stop(#state{ref=Ref}) ->
                  {ok, not_found, state()} |
                  {error, term(), state()}.
 get(Bucket, Key, #state{ref=Ref}=State) ->
-    io:write(State),
-    io:fwrite("\n"),
     case sqlite3:sql_exec(Ref, "SELECT value FROM store WHERE bucket = ? AND key = ?",
         [{1, Bucket}, {2, Key}]) of
         [{columns,_},{rows,[{Value}]}] ->
-            io:fwrite("Value: ~80p~n", [Value]),
             {ok, Value, State};
-        Result ->
-            io:fwrite("Result: ~80p~n", [Result]),
+        _Result ->
+            %io:fwrite("Result: ~80p~n", [Result]),
             {error, not_found, State}
     end.
+
+%TODO add type definition
+add_index(Ref, Bucket, Key, Field, FieldValue) ->
+    case sqlite3:sql_exec(Ref,
+        "UPDATE store SET " ++ binary:bin_to_list(Field) ++ " = ?
+            WHERE bucket = ? AND key = ?;",
+        [{1,FieldValue}, {2, Bucket}, {3, Key}]) of
+        ok -> ok;
+        % if column does not exist
+        % create one and an index
+        % TODO maybe use a transaction?
+        {error, _ErrorCode, _ErrorMsg} ->
+            %TODO add right type for column
+            ok = sqlite3:sql_exec(Ref,
+                "ALTER TABLE store ADD COLUMN " ++ binary:bin_to_list(Field) ++ " BLOB;"),
+            ok = sqlite3:sql_exec(Ref,
+                "UPDATE store SET " ++ binary:bin_to_list(Field) ++ " = ?
+                    WHERE bucket = ? AND key = ?;",
+                [{1, FieldValue}, {2, Bucket}, {3, Key}]),
+            ok
+    end.
+
+remove_index(Ref, Bucket, Key, Field) ->
+    sqlite3:sql_exec(Ref,
+        %TODO maybe do some error handling?
+        "UPDATE store SET " ++ binary:bin_to_list(Field) ++ " = NULL
+            WHERE bucket = ? AND key = ?;",
+        [{1, Bucket}, {2, Key}]).
+
 
 %% @doc Insert an object into the sqlite backend.
 -type index_spec() :: {add, Index, SecondaryKey} | {remove, Index, SecondaryKey}.
@@ -118,16 +144,27 @@ get(Bucket, Key, #state{ref=Ref}=State) ->
                  {ok, state()} |
                  {error, term(), state()}.
 put(Bucket, Key, IndexSpecs, Val, #state{ref=Ref}=State) ->
-    io:fwrite("Bucket: ~80p~n", [Bucket]),
-    io:fwrite("Key: ~80p~n", [Key]),
-    io:fwrite("IndexSpecs: ~80p~n", [IndexSpecs]),
-    io:fwrite("Val: ~80p~n", [Val]),
-    io:fwrite("Ref: ~80p~n", [Ref]),
+    %io:fwrite("Bucket: ~80p~n", [Bucket]),
+    %io:fwrite("Key: ~80p~n", [Key]),
+    %io:fwrite("IndexSpecs: ~80p~n", [IndexSpecs]),
+    % IndexSpecs: [{add,<<"field1_bin">>,<<"val1">>},{add,<<"field2_int">>,1001}]
+    %io:fwrite("Val: ~80p~n", [Val]),
+    %io:fwrite("Ref: ~80p~n", [Ref]),
+    SpecsHandler = fun(Spec) ->
+            case Spec of
+                {add, Field, FieldValue} ->
+                    ok = add_index(Ref, Bucket, Key, Field, FieldValue);
+                {remove, Field, _Value} ->
+                    ok = remove_index(Ref, Bucket, Key, Field)
+            end
+    end,
     case sqlite3:sql_exec(Ref,
             "INSERT OR REPLACE INTO store (bucket, key, value) VALUES (?, ?, ?);",
             [{1, Bucket}, {2, Key}, {3, Val}]) of
 
                 {rowid, _} ->
+                    % update secondary indexes
+                    lists:foreach(SpecsHandler, IndexSpecs),
                     {ok, State};
                 [_, _, Error] ->
                     {error, Error, State}
@@ -138,6 +175,8 @@ put(Bucket, Key, IndexSpecs, Val, #state{ref=Ref}=State) ->
                     {ok, state()} |
                     {error, term(), state()}.
 delete(Bucket, Key, _IndexSpecs, #state{ref=Ref}=State) ->
+    % we do not need to remove secondary indexes in another query
+    % thanks to sql DELETE FROM
     case sqlite3:sql_exec(Ref,
             "DELETE FROM store WHERE bucket = ? AND key = ?;",
             [{1, Bucket}, {2, Key}]) of
@@ -202,6 +241,27 @@ fold_buckets(FoldBucketsFun, Acc, _Opts, #state{ref=Ref}) ->
     Result = lists:foldl(FoldFun, Acc, Rows),
     {ok, Result}.
 
+fold_keys_query({index, FilterBucket, {eq, <<"$bucket">>, _}}) ->
+    {"SELECT bucket, key FROM store WHERE bucket = ?;", [{1, FilterBucket}]};
+
+fold_keys_query({index, FilterBucket, {eq, FilterField, FilterTerm}}) ->
+    {"SELECT bucket, key FROM store WHERE bucket = ? AND "
+        ++ binary:bin_to_list(FilterField) ++ " = ?;",
+        [{1, FilterBucket}, {2, FilterTerm}]
+    };
+
+fold_keys_query({index, FilterBucket, {range, <<"$key">>, StartKey, EndKey}}) ->
+    {"SELECT bucket, key FROM store WHERE bucket = ? AND
+        key >= ? AND key <= ?;",
+        [{1, FilterBucket}, {2, StartKey}, {3, EndKey}]
+    };
+
+fold_keys_query({index, FilterBucket, {range, FilterField, StartTerm, EndTerm}}) ->
+    {"SELECT bucket, key FROM store WHERE bucket = ? AND "
+        ++ binary:bin_to_list(FilterField) ++ " >= ? AND "
+        ++ binary:bin_to_list(FilterField) ++ " <= ? AND;",
+        [{1, FilterBucket}, {2, StartTerm}, {3, EndTerm}]
+    }.
 %% @doc Fold over all the keys for one or all buckets.
 -spec fold_keys(riak_kv_backend:fold_keys_fun(),
                 any(),
@@ -209,27 +269,30 @@ fold_buckets(FoldBucketsFun, Acc, _Opts, #state{ref=Ref}) ->
                 state()) -> {ok, term()} | {async, fun()}.
 fold_keys(FoldKeysFun, Acc, Opts, #state{ref=Ref}) ->
 
+    %% Figure out how we should limit the fold: by bucket, by
+    %% secondary index, or neither (fold across everything.)
     Bucket = lists:keyfind(bucket, 1, Opts),
-    BucketKeys = if
-        %TODO implement index queries
+    Index = lists:keyfind(index, 1, Opts),
+
+    %% Multiple limiters may exist. Take the most specific limiter.
+    {Query, QueryValues} = if
+        Index /= false ->
+            fold_keys_query(Index);
         Bucket /= false ->
             {bucket, FilterBucket} = Bucket,
-            [{columns, ["bucket", "key"]},{rows, Rows}] = sqlite3:sql_exec(Ref,
-                "SELECT bucket, key FROM store WHERE bucket = ?",
-                [{1, FilterBucket}]
-            ),
-            Rows;
+            {"SELECT bucket, key FROM store WHERE bucket = ?", {1, FilterBucket}};
         true ->
-            [{columns, ["bucket", "key"]},{rows, Rows}] = sqlite3:sql_exec(Ref,
-                "SELECT bucket, key FROM store"
-            ),
-            Rows
+            {"SELECT bucket, key FROM store;", []}
+    end,
+    Rows = case sqlite3:sql_exec(Ref, Query, QueryValues) of
+        [{columns, ["bucket", "key"]}, {rows, Rows2}] -> Rows2;
+        {error, 1, _ErrorMsg} -> []
     end,
     Folder = fun ({Bucket2, Key2}, Acc2) ->
             FoldKeysFun(Bucket2, Key2, Acc2)
     end,
     %TODO implement async fold
-    Result = lists:foldl(Folder, Acc, BucketKeys),
+    Result = lists:foldl(Folder, Acc, Rows),
     {ok, Result}.
 
 %% @doc Fold over all the objects for one or all buckets.
@@ -239,6 +302,7 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{ref=Ref}) ->
                    state()) -> {ok, any()} | {async, fun()}.
 fold_objects(FoldObjectsFun, Acc, Opts, #state{ref=Ref}) ->
     %TODO implement async fold
+    %TODO implement secondary index
     Bucket = lists:keyfind(bucket, 1, Opts),
     BucketsKeysValues = if
         Bucket /= false ->
