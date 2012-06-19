@@ -50,6 +50,7 @@ capabilities(_, _) ->
 %% @doc Start the sqlite backend
 -spec start(integer(), config()) -> {ok, state()} | {error, term()}.
 start(Partition, Config) ->
+    %fprof:trace(start),
     DataDir = filename:join(app_helper:get_prop_or_env(data_root, Config, sqlite3), integer_to_list(Partition)),
     filelib:ensure_dir(DataDir),
     %io:fwrite(DataDir),
@@ -75,6 +76,9 @@ start(Partition, Config) ->
             CONSTRAINT store_primary_key PRIMARY KEY (bucket, key)
         );"
     ),
+    % optimization? optimization!!!
+    ok = sqlite3:sql_exec(Db, "PRAGMA synchronous=OFF"),
+    % ok = sqlite3:sql_exec(Db, "PRAGMA count_changes=FALSE"),
     %% TODO prepare some statements
     %sqlite3:create_table(Db, store, [{bucket, blob}, {key, blob}, {value, blob}]),
     {ok, #state{ref=Pid}}.
@@ -91,8 +95,9 @@ start(Partition, Config) ->
 
 %% @doc Stop the sqlite backend
 stop(#state{ref=Ref}) ->
+    %fprof:trace(stop),
     %TODO maybe do some error handling?
-    sqlite3:close(Ref).
+    ok = sqlite3:close(Ref).
 
 %%%% @doc Retrieve an object from the sqlite backend
 -spec get(riak_object:bucket(), riak_object:key(), state()) ->
@@ -109,10 +114,18 @@ get(Bucket, Key, #state{ref=Ref}=State) ->
             {error, not_found, State}
     end.
 
+get_field_type(Field) ->
+    case lists:suffix("_int", Field) of
+        true -> "INTEGER";
+        false -> "BLOB"
+    end.
+
 %TODO add type definition
 add_index(Ref, Bucket, Key, Field, FieldValue) ->
+
+    FieldString = binary:bin_to_list(Field),
     case sqlite3:sql_exec(Ref,
-        "UPDATE store SET " ++ binary:bin_to_list(Field) ++ " = ?
+        "UPDATE store SET " ++ FieldString ++ " = ?
             WHERE bucket = ? AND key = ?;",
         [{1,FieldValue}, {2, Bucket}, {3, Key}]) of
         ok -> ok;
@@ -120,11 +133,14 @@ add_index(Ref, Bucket, Key, Field, FieldValue) ->
         % create one and an index
         % TODO maybe use a transaction?
         {error, _ErrorCode, _ErrorMsg} ->
-            %TODO add right type for column
             ok = sqlite3:sql_exec(Ref,
-                "ALTER TABLE store ADD COLUMN " ++ binary:bin_to_list(Field) ++ " BLOB;"),
+                "ALTER TABLE store ADD COLUMN " ++ FieldString
+                    ++ " " ++ get_field_type(FieldString) ++ ";"),
             ok = sqlite3:sql_exec(Ref,
-                "UPDATE store SET " ++ binary:bin_to_list(Field) ++ " = ?
+                "CREATE INDEX store_secondary_index_" ++ FieldString ++
+                " ON store (" ++ FieldString ++ ");" ),
+            ok = sqlite3:sql_exec(Ref,
+                "UPDATE store SET " ++ FieldString ++ " = ?
                     WHERE bucket = ? AND key = ?;",
                 [{1, FieldValue}, {2, Bucket}, {3, Key}]),
             ok
@@ -159,16 +175,49 @@ put(Bucket, Key, IndexSpecs, Val, #state{ref=Ref}=State) ->
             end
     end,
     case sqlite3:sql_exec(Ref,
-            "INSERT OR REPLACE INTO store (bucket, key, value) VALUES (?, ?, ?);",
-            [{1, Bucket}, {2, Key}, {3, Val}]) of
-
-                {rowid, _} ->
-                    % update secondary indexes
-                    lists:foreach(SpecsHandler, IndexSpecs),
-                    {ok, State};
-                [_, _, Error] ->
-                    {error, Error, State}
+                    "INSERT INTO store (bucket, key, value) VALUES (?, ?, ?);",
+                    [{1, Bucket}, {2, Key}, {3, Val}]) of
+                        {rowid, _} ->
+                            % update secondary indexes
+                            lists:foreach(SpecsHandler, IndexSpecs),
+                            {ok, State};
+                        {error, 19, "constraint failed"} ->
+                            %io:format("updating..."),
+                            ok = sqlite3:sql_exec(Ref, "UPDATE store SET value = ?
+                                    WHERE bucket = ? AND key = ?;",
+                                [{1, Val}, {2, Bucket}, {3, Key}]
+                            ),
+                            lists:foreach(SpecsHandler, IndexSpecs),
+                            {ok, State};
+                        {error, _, Error} ->
+                            io:format("~p~n",[Error]),
+                            {error, Error, State}
     end.
+
+    % request 1
+    %ok = sqlite3:sql_exec(Ref, "UPDATE store SET value = ?
+    %        WHERE bucket = ? AND key = ?;",
+    %    [{1, Val}, {2, Bucket}, {3, Key}]
+    %),
+    % request 2
+    %case sqlite3:sql_exec(Ref, "SELECT changes()") of
+    %    [{columns,["changes()"]},{rows,[{0}]}] ->
+    %        case sqlite3:sql_exec(Ref,
+    %                "INSERT OR REPLACE INTO store (bucket, key, value) VALUES (?, ?, ?);",
+    %                [{1, Bucket}, {2, Key}, {3, Val}]) of
+
+    %                    {rowid, _} ->
+    %                        % update secondary indexes
+    %                        lists:foreach(SpecsHandler, IndexSpecs),
+    %                        {ok, State};
+    %                    [_, _, Error] ->
+    %                        {error, Error, State}
+
+    %         end;
+    %     [{columns,["changes()"]},{rows,[{1}]}] ->
+    %         lists:foreach(SpecsHandler, IndexSpecs),
+    %         {ok, State}
+    %end.
 
 %%%% @doc Delete an object from the sqlite backend
 -spec delete(riak_object:bucket(), riak_object:key(), [index_spec()], state()) ->
@@ -259,7 +308,7 @@ fold_keys_query({index, FilterBucket, {range, <<"$key">>, StartKey, EndKey}}) ->
 fold_keys_query({index, FilterBucket, {range, FilterField, StartTerm, EndTerm}}) ->
     {"SELECT bucket, key FROM store WHERE bucket = ? AND "
         ++ binary:bin_to_list(FilterField) ++ " >= ? AND "
-        ++ binary:bin_to_list(FilterField) ++ " <= ? AND;",
+        ++ binary:bin_to_list(FilterField) ++ " <= ?;",
         [{1, FilterBucket}, {2, StartTerm}, {3, EndTerm}]
     }.
 %% @doc Fold over all the keys for one or all buckets.
@@ -284,6 +333,8 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{ref=Ref}) ->
         true ->
             {"SELECT bucket, key FROM store;", []}
     end,
+    %io:format("Executing: ~p~n",[Query]),
+    %io:format("Query values: ~p~n", [QueryValues]),
     Rows = case sqlite3:sql_exec(Ref, Query, QueryValues) of
         [{columns, ["bucket", "key"]}, {rows, Rows2}] -> Rows2;
         {error, 1, _ErrorMsg} -> []
