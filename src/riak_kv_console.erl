@@ -25,6 +25,7 @@
 -module(riak_kv_console).
 
 -export([join/1,
+         staged_join/1,
          leave/1,
          remove/1,
          status/1,
@@ -41,10 +42,19 @@
 
 
 join([NodeStr]) ->
+    join(NodeStr, fun riak_core:join/1,
+         "Sent join request to ~s~n", [NodeStr]).
+
+staged_join([NodeStr]) ->
+    Node = list_to_atom(NodeStr),
+    join(NodeStr, fun riak_core:staged_join/1,
+         "Success: staged join request for ~p to ~p~n", [node(), Node]).
+
+join(NodeStr, JoinFn, SuccessFmt, SuccessArgs) ->
     try
-        case riak_core:join(NodeStr) of
+        case JoinFn(NodeStr) of
             ok ->
-                io:format("Sent join request to ~s~n", [NodeStr]),
+                io:format(SuccessFmt, SuccessArgs),
                 ok;
             {error, not_reachable} ->
                 io:format("Node ~s is not reachable!~n", [NodeStr]),
@@ -276,12 +286,13 @@ transfers([]) ->
                 %% Display base status
                 Type = proplists:get_value(type, Status),
                 Mod = proplists:get_value(mod, Status),
-                Partition = proplists:get_value(partition, Status),
+                SrcPartition = proplists:get_value(src_partition, Status),
+                TargetPartition = proplists:get_value(target_partition, Status),
                 StartTS = proplists:get_value(start_ts, Status),
                 SrcNode = proplists:get_value(src_node, Status),
                 TargetNode = proplists:get_value(target_node, Status),
 
-                print_v2_status(Type, Mod, Partition, StartTS),
+                print_v2_status(Type, Mod, {SrcPartition, TargetPartition}, StartTS),
 
                 %% Get info about stats if there is any yet
                 Stats = proplists:get_value(stats, Status),
@@ -407,14 +418,20 @@ print_vnode_status([StatusItem | RestStatusItems]) ->
     end,
     print_vnode_status(RestStatusItems).
 
-print_v2_status(Type, Mod, Partition, StartTS) ->
+print_v2_status(Type, Mod, {SrcPartition, TargetPartition}, StartTS) ->
     StartTSStr = datetime_str(StartTS),
     Running = timer:now_diff(now(), StartTS),
     RunningStr = riak_core_format:human_time_fmt("~.2f", Running),
 
     io:format("transfer type: ~s~n", [Type]),
     io:format("vnode type: ~p~n", [Mod]),
-    io:format("partition: ~p~n", [Partition]),
+    case Type of
+        repair ->
+            io:format("source partition: ~p~n", [SrcPartition]),
+            io:format("target partition: ~p~n", [TargetPartition]);
+        _ ->
+            io:format("partition: ~p~n", [TargetPartition])
+    end,
     io:format("started: ~s [~s ago]~n", [StartTSStr, RunningStr]).
 
 print_v1_status(Mod, Partition, Node) ->
