@@ -181,7 +181,7 @@ put(Bucket, Key, IndexSpecs, Val, #state{ref=Ref}=State) ->
                             % update secondary indexes
                             lists:foreach(SpecsHandler, IndexSpecs),
                             {ok, State};
-                        {error, 19, "constraint failed"} ->
+                        {error, 19, _Error} ->
                             %io:format("updating..."),
                             ok = sqlite3:sql_exec(Ref, "UPDATE store SET value = ?
                                     WHERE bucket = ? AND key = ?;",
@@ -189,8 +189,8 @@ put(Bucket, Key, IndexSpecs, Val, #state{ref=Ref}=State) ->
                             ),
                             lists:foreach(SpecsHandler, IndexSpecs),
                             {ok, State};
-                        {error, _, Error} ->
-                            io:format("~p~n",[Error]),
+                        {error, Code, Error} ->
+                            io:format("~p: ~p~n",[Code, Error]),
                             {error, Error, State}
     end.
 
