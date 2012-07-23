@@ -272,7 +272,7 @@ field_types() ->
      {?KEYFIELD,    fun parse_binary/1},
      {<<"_bin">>,    fun parse_binary/1},
      {<<"_int">>,    fun parse_integer/1},
-     {<<"_spatial_point">>, fun parse_spatial/1}
+     {<<"_spatial">>, fun parse_spatial/1}
     ].
 
 
