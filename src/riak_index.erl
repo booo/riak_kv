@@ -271,9 +271,13 @@ field_types() ->
      {?BUCKETFIELD, fun parse_binary/1},
      {?KEYFIELD,    fun parse_binary/1},
      {<<"_bin">>,    fun parse_binary/1},
-     {<<"_int">>,    fun parse_integer/1}
+     {<<"_int">>,    fun parse_integer/1},
+     {<<"_spatial_point">>, fun parse_spatial/1}
     ].
 
+
+parse_spatial(Value) ->
+    {ok, Value}.
 
 %% @private
 %% @spec parse_binary(string()) -> {ok, binary()}

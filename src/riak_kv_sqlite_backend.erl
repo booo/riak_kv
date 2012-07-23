@@ -77,8 +77,15 @@ start(Partition, Config) ->
         );"
     ),
     % optimization? optimization!!!
-    ok = sqlite3:sql_exec(Db, "PRAGMA synchronous=OFF"),
-    % ok = sqlite3:sql_exec(Db, "PRAGMA count_changes=FALSE"),
+    ok = sqlite3:sql_exec(Db, "PRAGMA synchronous=OFF;"),
+    ok = sqlite3:sql_exec(Db, "PRAGMA count_changes=FALSE;"),
+    ok = sqlite3:sql_exec(Db, "PRAGMA auto_vacuum=FULL;"),
+    [{columns, _},{rows,[{null}]}] =
+        sqlite3:sql_exec(Db, "SELECT load_extension('libspatialite.so.3')"),
+    % this pattern matching is useless
+    [{columns, _},{rows,[{_Value}]}] =
+        sqlite3:sql_exec(Db, "SELECT InitSpatialMetaData()"),
+    [{columns,["locking_mode"]},{rows,[{<<"exclusive">>}]}] = sqlite3:sql_exec(Db, "PRAGMA locking_mode=EXCLUSIVE;"),
     %% TODO prepare some statements
     %sqlite3:create_table(Db, store, [{bucket, blob}, {key, blob}, {value, blob}]),
     {ok, #state{ref=Pid}}.
@@ -122,28 +129,63 @@ get_field_type(Field) ->
 
 %TODO add type definition
 add_index(Ref, Bucket, Key, Field, FieldValue) ->
-
     FieldString = binary:bin_to_list(Field),
-    case sqlite3:sql_exec(Ref,
-        "UPDATE store SET " ++ FieldString ++ " = ?
-            WHERE bucket = ? AND key = ?;",
-        [{1,FieldValue}, {2, Bucket}, {3, Key}]) of
+    Query = case lists:suffix("_spatial", FieldString) of
+        true -> "UPDATE store SET " ++ FieldString ++ " = ST_GeomFromText(?, 4326)
+                    WHERE bucket = ? AND key = ?;";
+        false -> "UPDATE store SET " ++ FieldString ++ " = ?
+                    WHERE bucket = ? AND key = ?;"
+        end,
+    case sqlite3:sql_exec(Ref, Query,
+        [{1,mochiweb_util:unquote(FieldValue)}, {2, Bucket}, {3, Key}]) of
         ok -> ok;
         % if column does not exist
         % create one and an index
         % TODO maybe use a transaction?
         {error, _ErrorCode, _ErrorMsg} ->
-            ok = sqlite3:sql_exec(Ref,
-                "ALTER TABLE store ADD COLUMN " ++ FieldString
-                    ++ " " ++ get_field_type(FieldString) ++ ";"),
-            ok = sqlite3:sql_exec(Ref,
-                "CREATE INDEX store_secondary_index_" ++ FieldString ++
-                " ON store (" ++ FieldString ++ ");" ),
-            ok = sqlite3:sql_exec(Ref,
-                "UPDATE store SET " ++ FieldString ++ " = ?
-                    WHERE bucket = ? AND key = ?;",
-                [{1, FieldValue}, {2, Bucket}, {3, Key}]),
-            ok
+            Condition = {lists:suffix("_int", FieldString),
+                lists:suffix("_bin", FieldString),
+                lists:suffix("_spatial", FieldString)},
+
+            % TODO I'm so ugly please beautify me
+            case Condition of
+                {true, false, false} ->
+                    ok = sqlite3:sql_exec(Ref,
+                        "ALTER TABLE store ADD COLUMN " ++ FieldString
+                            ++ " " ++ get_field_type(FieldString) ++ ";"),
+                    ok = sqlite3:sql_exec(Ref,
+                        "CREATE INDEX store_secondary_index_" ++ FieldString ++
+                        " ON store (" ++ FieldString ++ ");" ),
+                    sqlite3:sql_exec(Ref,
+                        "UPDATE store SET " ++ FieldString ++ " = ?
+                            WHERE bucket = ? AND key = ?;",
+                        [{1, FieldValue}, {2, Bucket}, {3, Key}]);
+                %% TODO this is somehow duplicated
+                {false, true, false} ->
+                    ok = sqlite3:sql_exec(Ref,
+                        "ALTER TABLE store ADD COLUMN " ++ FieldString
+                            ++ " " ++ get_field_type(FieldString) ++ ";"),
+                    ok = sqlite3:sql_exec(Ref,
+                        "CREATE INDEX store_secondary_index_" ++ FieldString ++
+                        " ON store (" ++ FieldString ++ ");" ),
+                    sqlite3:sql_exec(Ref,
+                        "UPDATE store SET " ++ FieldString ++ " = ?
+                            WHERE bucket = ? AND key = ?;",
+                        [{1, FieldValue}, {2, Bucket}, {3, Key}]);
+                {false, false, true} ->
+                    [{columns,_},{rows,[{1}]}] = sqlite3:sql_exec(Ref,
+                        "SELECT AddGeometryColumn('store', ?, 4326, 'GEOMETRY', 'XY');",
+                        [{1, Field}]
+                    ),
+                    [{columns,_},{rows,[{1}]}] = sqlite3:sql_exec(Ref,
+                        "SELECT CreateSpatialIndex('store' , ?);",
+                        [{1, Field}]
+                    ),
+                    sqlite3:sql_exec(Ref,
+                        "UPDATE store SET " ++ FieldString ++ " = ST_GeomFromText(?, 4326)
+                            WHERE bucket = ? AND key = ?;",
+                        [{1, mochiweb_util:unquote(FieldValue)}, {2, Bucket}, {3, Key}])
+            end
     end.
 
 remove_index(Ref, Bucket, Key, Field) ->
@@ -193,31 +235,6 @@ put(Bucket, Key, IndexSpecs, Val, #state{ref=Ref}=State) ->
                             io:format("~p: ~p~n",[Code, Error]),
                             {error, Error, State}
     end.
-
-    % request 1
-    %ok = sqlite3:sql_exec(Ref, "UPDATE store SET value = ?
-    %        WHERE bucket = ? AND key = ?;",
-    %    [{1, Val}, {2, Bucket}, {3, Key}]
-    %),
-    % request 2
-    %case sqlite3:sql_exec(Ref, "SELECT changes()") of
-    %    [{columns,["changes()"]},{rows,[{0}]}] ->
-    %        case sqlite3:sql_exec(Ref,
-    %                "INSERT OR REPLACE INTO store (bucket, key, value) VALUES (?, ?, ?);",
-    %                [{1, Bucket}, {2, Key}, {3, Val}]) of
-
-    %                    {rowid, _} ->
-    %                        % update secondary indexes
-    %                        lists:foreach(SpecsHandler, IndexSpecs),
-    %                        {ok, State};
-    %                    [_, _, Error] ->
-    %                        {error, Error, State}
-
-    %         end;
-    %     [{columns,["changes()"]},{rows,[{1}]}] ->
-    %         lists:foreach(SpecsHandler, IndexSpecs),
-    %         {ok, State}
-    %end.
 
 %%%% @doc Delete an object from the sqlite backend
 -spec delete(riak_object:bucket(), riak_object:key(), [index_spec()], state()) ->
@@ -294,9 +311,36 @@ fold_keys_query({index, FilterBucket, {eq, <<"$bucket">>, _}}) ->
     {"SELECT bucket, key FROM store WHERE bucket = ?;", [{1, FilterBucket}]};
 
 fold_keys_query({index, FilterBucket, {eq, FilterField, FilterTerm}}) ->
-    {"SELECT bucket, key FROM store WHERE bucket = ? AND "
-        ++ binary:bin_to_list(FilterField) ++ " = ?;",
-        [{1, FilterBucket}, {2, FilterTerm}]
+    FilterFieldString = binary:bin_to_list(FilterField),
+    case lists:suffix("_spatial", FilterFieldString) of
+
+        true -> fold_keys_query({index, FilterBucket, {spatial, FilterField, FilterTerm}});
+
+        false -> {"SELECT bucket, key FROM store WHERE bucket = ? AND "
+            ++ FilterFieldString ++ " = ?;",
+            [{1, FilterBucket}, {2, FilterTerm}]
+        }
+    end;
+
+fold_keys_query({index, FilterBucket, {spatial, FilterField, FilterTerm}}) ->
+    FilterFieldString = binary:bin_to_list(FilterField),
+    {"SELECT bucket, key FROM store
+        WHERE bucket = ?
+        AND
+        ROWID IN (
+            SELECT pkid FROM idx_store_" ++ FilterFieldString
+            ++ " WHERE pkid MATCH RTreeIntersects(
+            MbrMinX(ST_GeomFromText(?, 4326)),
+            MbrMinY(ST_GeomFromText(?, 4326)),
+            MbrMaxX(ST_GeomFromText(?, 4326)),
+            MbrMaxY(ST_GeomFromText(?, 4326))
+        ))
+        AND
+        ST_intersects(" ++ FilterFieldString ++
+                ", ST_GeomFromText(?, 4326))"
+      ,
+      [{1, FilterBucket}, {2, FilterTerm}, {3, FilterTerm}, {4, FilterTerm},
+       {5, FilterTerm}, {6, FilterTerm}]
     };
 
 fold_keys_query({index, FilterBucket, {range, <<"$key">>, StartKey, EndKey}}) ->
@@ -337,7 +381,11 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{ref=Ref}) ->
     %io:format("Query values: ~p~n", [QueryValues]),
     Rows = case sqlite3:sql_exec(Ref, Query, QueryValues) of
         [{columns, ["bucket", "key"]}, {rows, Rows2}] -> Rows2;
-        {error, 1, _ErrorMsg} -> []
+        {error, Code, Error} ->
+            %TODO add some error handling, e.g. for table does not exists
+            %indexes don't exist on some tables
+            io:format("~p: ~p~n",[Code, Error]),
+            []
     end,
     Folder = fun ({Bucket2, Key2}, Acc2) ->
             FoldKeysFun(Bucket2, Key2, Acc2)
